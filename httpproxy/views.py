@@ -1,89 +1,93 @@
-import logging
-import urllib2
-from urlparse import urlparse
-
+import requests
 from django.http import HttpResponse
-from django.views.generic import View
+from django.http import QueryDict
+import urllib
 
-from httpproxy.recorder import ProxyRecorder
+
+def HttpProxy(request, url, requests_args=None):
+    """
+    Forward as close to an exact copy of the request as possible along to the
+    given url.  Respond with as close to an exact copy of the resulting
+    response as possible.
+
+    If there are any additional arguments you wish to send to requests, put
+    them in the requests_args dictionary.
+    """
+    #import ipdb;ipdb.set_trace()
+    #decode url before passing it on the request session
+    url = urllib.unquote(request.GET['url']).decode('utf8') 
+    #print 'calling ',  url #urllib.unquote(url).decode('utf8')
+    
+    requests_args = (requests_args or {}).copy()
+    headers = get_headers(request.META)
+    params = request.GET.copy()
+
+    if 'headers' not in requests_args:
+        requests_args['headers'] = {}
+    if 'data' not in requests_args:
+        requests_args['data'] = request.body
+    if 'params' not in requests_args:
+        requests_args['params'] = QueryDict('', mutable=True)
+
+    # Overwrite any headers and params from the incoming request with explicitly
+    # specified values for the requests library.
+    headers.update(requests_args['headers'])
+    params.update(requests_args['params'])
+
+    # If there's a content-length header from Django, it's probably in all-caps
+    # and requests might not notice it, so just remove it.
+    for key in headers.keys():
+        if key.lower() == 'content-length':
+            del headers[key]
+
+    requests_args['headers'] = headers
+    requests_args['params'] = params
+
+    response = requests.request(request.method, url, **requests_args)
+
+    proxy_response = HttpResponse(
+        response.content,
+        status=response.status_code)
+
+    excluded_headers = set([
+        # Hop-by-hop headers
+        # ------------------
+        # Certain response headers should NOT be just tunneled through.  These
+        # are they.  For more info, see:
+        # http://www.w3.org/Protocols/rfc2616/rfc2616-sec13.html#sec13.5.1
+        'connection', 'keep-alive', 'proxy-authenticate', 
+        'proxy-authorization', 'te', 'trailers', 'transfer-encoding', 
+        'upgrade', 
+
+        # Although content-encoding is not listed among the hop-by-hop headers,
+        # it can cause trouble as well.  Just let the server set the value as
+        # it should be.
+        'content-encoding',
+
+        # Since the remote server may or may not have sent the content in the
+        # same encoding as Django will, let Django worry about what the length
+        # should be.
+        'content-length',
+    ])
+    for key, value in response.headers.iteritems():
+        if key.lower() in excluded_headers:
+            continue
+        proxy_response[key] = value
+
+    return proxy_response
 
 
-logger = logging.getLogger(__name__)
+def get_headers(environ):
+    """
+    Retrieve the HTTP headers from a WSGI environment dictionary.  See
+    https://docs.djangoproject.com/en/dev/ref/request-response/#django.http.HttpRequest.META
+    """
+    headers = {}
+    for key, value in environ.iteritems():
+        # Sometimes, things don't like when you send the requesting host through.
+        if key.startswith('HTTP_') and key != 'HTTP_HOST':
+            headers[key[5:].replace('_', '-')] = value
+        elif key in ('CONTENT_TYPE', 'CONTENT_LENGTH'):
+            headers[key.replace('_', '-')] = value
 
-class HttpProxy(View):
-
-    mode = None
-    base_url = None
-    msg = 'Response body: \n%s'
-
-    def dispatch(self, request, url, *args, **kwargs):
-        self.url = url
-        request = self.normalize_request(request)
-        if self.mode == 'play':
-            return self.play(request)
-
-        response = super(HttpProxy, self).dispatch(request, *args, **kwargs)
-        if self.mode == 'record':
-            self.record(response)
-        return response
-
-    def normalize_request(self, request):
-        """
-        Updates all path-related info in the original request object with the url
-        given to the proxy
-
-        This way, any further processing of the proxy'd request can just ignore
-        the url given to the proxy and use request.path safely instead.
-        """
-        if not self.url.startswith('/'):
-            self.url = '/' + self.url
-        request.path = self.url
-        request.path_info = self.url
-        request.META['PATH_INFO'] = self.url
-        return request
-
-    def play(self, request):
-        """
-        Plays back the response to a request, based on a previously recorded
-        request/response
-        """
-        return self.get_recorder().playback(request)
-
-    def record(self, response):
-        """
-        Records the request being made and its response
-        """
-        self.get_recorder().record(self.request, response)
-
-    def get_recorder(self):
-        url = urlparse(self.base_url)
-        return ProxyRecorder(domain=url.hostname, port=(url.port or 80))
-
-    def get(self, request, *args, **kwargs):
-        request_url = self.get_full_url(self.url)
-        request = self.create_request(request_url)
-        response = urllib2.urlopen(request)
-        try:
-            response_body = response.read()
-            status = response.getcode()
-            logger.debug(self.msg % response_body)
-        except urllib2.HTTPError, e:
-            response_body = e.read()
-            logger.error(self.msg % response_body)
-            status = e.code
-        return HttpResponse(response_body, status=status,
-                content_type=response.headers['content-type'])
-
-    def get_full_url(self, url):
-        """
-        Constructs the full URL to be requested
-        """
-        param_str = self.request.GET.urlencode()
-        request_url = u'%s/%s' % (self.base_url, url)
-        request_url += '?%s' % param_str if param_str else ''
-        return request_url
-
-    def create_request(self, url, body=None, headers={}):
-        request = urllib2.Request(url, body, headers)
-        logger.info('%s %s' % (request.get_method(), request.get_full_url()))
-        return request
+    return headers

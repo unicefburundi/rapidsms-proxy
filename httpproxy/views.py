@@ -1,4 +1,4 @@
-#import requests
+import requests
 from django.http import HttpResponse
 from django.http import QueryDict
 import urllib
